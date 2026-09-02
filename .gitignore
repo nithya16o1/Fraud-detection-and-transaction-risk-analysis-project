@@ -1,0 +1,33 @@
+# Python environment & cache
+
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Data files (raw & processed datasets gitignored)
+
+sentinel/data/raw/*
+!sentinel/data/raw/README.md
+sentinel/data/processed/*
+!sentinel/data/processed/README.md
+*.csv
+*.parquet
+
+# Model artifacts & environment variables
+
+*.joblib
+*.pkl
+.env
+.streamlit/
+
+# Testing & Logs
+
+.pytest_cache/
+*.log
+sentinel/data/audit_log.jsonl
+SENTINEL_BUILD_GUIDE.md
+SENTINEL_BUILD_GUIDE.txt
