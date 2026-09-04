@@ -1,0 +1,21 @@
+{
+  "chosen_threshold": 0.7,
+  "test_precision": 0.6694745286803049,
+  "test_recall": 0.40382288894265667,
+  "test_f1": 0.5037730153939028,
+  "test_auc": 0.8836891380887955,
+  "feature_cols": [
+    "TransactionAmt",
+    "card1",
+    "card2",
+    "card3",
+    "card5",
+    "addr1",
+    "addr2",
+    "dist1",
+    "C1",
+    "C2",
+    "C5",
+    "C13"
+  ]
+}
