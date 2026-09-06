@@ -2,218 +2,255 @@ import os
 
 import json
 
-import pandas as pd
+import numpy as np
 
 from dotenv import load_dotenv
 
-from openai import OpenAI
-
 load_dotenv()
 
-SYSTEM_PROMPT = """
 
-You are Sentinel AI Risk Manager — an evidence synthesizer for payment dispute investigations.
-
-Input: Numerical risk score from an ML model and historical timeline deviation stats.
-
-YOUR STRICT MANDATE: Describe ONLY what the numerical input data explicitly shows.
-
-Do NOT invent backstory, fake user behavior, or unprovided facts.
-
-Return a JSON object with this EXACT structure:
-
-{
-
-  "primary_concern": "string",
-
-  "secondary_concern": "string",
-
-  "evidence": ["list of numerical evidence facts"],
-
-  "confidence": "High" | "Medium" | "Low",
-
-  "recommendation": "Contest" | "Review" | "Accept"
-
-}
-
-"""
-
-def compute_empirical_cutoffs(df: pd.DataFrame) -> dict:
-
+def compute_empirical_cutoffs(df):
+    """
+    Computes empirical behavioral cutoffs from the dataset.
     """
 
-    Computes dynamic feature cutoffs based on the midpoints between
+    fraud_df = df[df["isFraud"] == 1]
 
-    fraud and legitimate transaction medians in the dataset (FIX #3).
+    legit_df = df[df["isFraud"] == 0]
 
+    spike_fraud = fraud_df["amt_vs_rolling_avg"].median()
+
+    spike_legit = legit_df["amt_vs_rolling_avg"].median()
+
+    spike_cutoff = max(
+        1.0,
+        round(
+            float((spike_fraud + spike_legit) / 2.0),
+            2
+        )
+    )
+
+    tx24_fraud = fraud_df["tx_count_last_24h"].median()
+
+    tx24_legit = legit_df["tx_count_last_24h"].median()
+
+    tx24_cutoff = max(
+        1,
+        int(
+            round(
+                float((tx24_fraud + tx24_legit) / 2.0)
+            )
+        )
+    )
+
+    return {
+        "spike_cutoff": spike_cutoff,
+        "tx24_cutoff": tx24_cutoff
+    }
+
+
+def synthesize_evidence(
+    transaction_id,
+    amount,
+    ml_score,
+    threshold,
+    amt_vs_avg,
+    tx_24h,
+    time_since_last_tx,
+    spike_cutoff,
+    tx24_cutoff
+):
+    """
+    Synthesizes evidence using deterministic rules or an LLM.
     """
 
-    fraud_mask = (df['isFraud'] == 1)
+    high_ml_risk = ml_score >= threshold
 
-    legit_mask = (df['isFraud'] == 0)
+    high_velocity = tx_24h >= tx24_cutoff
 
-    spike_fraud = df.loc[fraud_mask, 'amt_vs_rolling_avg'].median()
+    spending_spike = amt_vs_avg > spike_cutoff
 
-    spike_legit = df.loc[legit_mask, 'amt_vs_rolling_avg'].median()
+    if high_ml_risk:
 
-    tx24_fraud = df.loc[fraud_mask, 'tx_count_last_24h'].median()
-
-    tx24_legit = df.loc[legit_mask, 'tx_count_last_24h'].median()
-
-    spike_cutoff = round(float((spike_fraud + spike_legit) / 2.0), 2)
-
-    tx24_cutoff = max(1, int(round((tx24_fraud + tx24_legit) / 2.0)))
-
-    print("\n[EMPIRICAL CUTOFF DERIVATION]")
-
-    print(f"  - Amount Spike Ratio -> Fraud Median: {spike_fraud:.2f}x | Legit Median: {spike_legit:.2f}x => Derived Cutoff: {spike_cutoff:.2f}x")
-
-    print(f"  - 24h Tx Velocity   -> Fraud Median: {tx24_fraud:.0f} | Legit Median: {tx24_legit:.0f} => Derived Cutoff: {tx24_cutoff}")
-
-    return {"spike_cutoff": spike_cutoff, "tx24_cutoff": tx24_cutoff}
-
-def deterministic_policy_recommendation(
-
-    ml_score: float,
-
-    threshold: float,
-
-    amt_vs_avg: float,
-
-    tx_24h: int,
-
-    spike_cutoff: float = 2.0,
-
-    tx24_cutoff: int = 2
-
-) -> str:
-
-    """
-
-    Deterministic rule engine serving as fallback and sanity check.
-
-    Cutoffs are dynamically derived from empirical dataset medians (FIX #3).
-
-    """
-
-    if ml_score >= threshold:
-
-        if amt_vs_avg >= spike_cutoff or tx_24h >= tx24_cutoff:
-
-            return "Review"
-
-        else:
-
-            return "Accept"
+        primary_concern = (
+            f"High ML fraud risk detected "
+            f"(score: {ml_score:.4f}; "
+            f"threshold: {threshold:.2f})"
+        )
 
     else:
 
-        return "Contest"
+        primary_concern = (
+            f"Low ML fraud risk score "
+            f"({ml_score:.4f}; "
+            f"threshold: {threshold:.2f})"
+        )
 
-def synthesize_evidence(
+    if tx_24h == 0 and time_since_last_tx <= 0:
 
-    transaction_id: int,
+        secondary_concern = (
+            "Insufficient transaction history "
+            "to establish a baseline"
+        )
 
-    amount: float,
+    elif high_velocity:
 
-    ml_score: float,
+        secondary_concern = (
+            f"High transaction velocity detected "
+            f"({tx_24h} transactions in the last 24h; "
+            f"cutoff: {tx24_cutoff})"
+        )
 
-    threshold: float,
+    elif spending_spike:
 
-    amt_vs_avg: float,
+        secondary_concern = (
+            f"Recent spending spike detected "
+            f"({amt_vs_avg:.2f}x average)"
+        )
 
-    tx_24h: int,
+    else:
 
-    spike_cutoff: float = 2.0,
+        secondary_concern = (
+            "Normal historical spending velocity"
+        )
 
-    tx24_cutoff: int = 2
+    evidence = [
+        primary_concern,
+        secondary_concern,
+        f"Transaction amount: ${amount:.2f}",
+        f"24h transaction count: {tx_24h}",
+        f"Amount vs historical average: {amt_vs_avg:.2f}x"
+    ]
 
-):
+    if high_ml_risk and (high_velocity or spending_spike):
 
-    rule_rec = deterministic_policy_recommendation(ml_score, threshold, amt_vs_avg, tx_24h, spike_cutoff, tx24_cutoff)
+        rule_recommendation = "Send to Review"
+
+    elif high_ml_risk:
+
+        rule_recommendation = "Send to Review"
+
+    elif not high_ml_risk and not high_velocity and not spending_spike:
+
+        rule_recommendation = "Contest Dispute"
+
+    else:
+
+        rule_recommendation = "Accept Loss"
+
+    recommendation = rule_recommendation
+
+    disagreement_flag = False
 
     api_key = os.getenv("OPENAI_API_KEY")
 
-    if not api_key or api_key == "your_openai_api_key_here":
-
-        evidence_list = [
-
-            f"Transaction #{transaction_id} Amount: ${amount:.2f}",
-
-            f"ML Fraud Score: {ml_score:.4f} (Cutoff Threshold: {threshold:.2f})",
-
-            f"Spending Velocity: {amt_vs_avg:.2f}x card's historical average (Empirical Cutoff: {spike_cutoff:.2f}x)",
-
-            f"24-Hour Velocity: {tx_24h} prior transactions in last 24h (Empirical Cutoff: {tx24_cutoff})"
-
-        ]
+    if not api_key:
 
         return {
-
-            "primary_concern": f"ML fraud score ({ml_score:.2f}) exceeds threshold ({threshold:.2f})" if ml_score >= threshold else "Low ML risk probability score",
-
-            "secondary_concern": f"Recent spending spike detected ({amt_vs_avg:.2f}x average)" if amt_vs_avg >= spike_cutoff else "Normal historical spending velocity",
-
-            "evidence": evidence_list,
-
-            "confidence": "High",
-
-            "recommendation": rule_rec,
-
-            "rule_recommendation": rule_rec,
-
-            "disagreement_flag": False
-
+            "primary_concern": primary_concern,
+            "secondary_concern": secondary_concern,
+            "evidence": evidence,
+            "recommendation": recommendation,
+            "rule_recommendation": rule_recommendation,
+            "disagreement_flag": disagreement_flag
         }
 
     try:
 
+        from openai import OpenAI
+
         client = OpenAI(api_key=api_key)
 
-        prompt = f"""
-
-        Transaction ID: {transaction_id}
-
-        Disputed Amount: ${amount:.2f}
-
-        ML Fraud Risk Score: {ml_score:.4f} (Threshold: {threshold:.2f})
-
-        Amount vs Rolling Avg Ratio: {amt_vs_avg:.2f}x (Cutoff: {spike_cutoff:.2f}x)
-
-        Transactions in Last 24h: {tx_24h} (Cutoff: {tx24_cutoff})
-
-        """
-
-        res = client.chat.completions.create(
-
-            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-
-            response_format={"type": "json_object"},
-
-            messages=[
-
-                {"role": "system", "content": SYSTEM_PROMPT},
-
-                {"role": "user", "content": prompt}
-
-            ],
-
-            temperature=0.1
-
+        model_name = os.getenv(
+            "LLM_MODEL",
+            "gpt-4o-mini"
         )
 
-        result = json.loads(res.choices[0].message.content)
+        prompt = f"""
+You are a fraud investigation assistant.
 
-        disagreement = (result.get("recommendation") != rule_rec)
+Analyze the transaction using ONLY the provided evidence.
 
-        result["rule_recommendation"] = rule_rec
+Transaction ID: {transaction_id}
+Transaction Amount: ${amount:.2f}
+ML Fraud Score: {ml_score:.4f}
+Decision Threshold: {threshold:.2f}
+Amount vs Historical Average: {amt_vs_avg:.2f}x
+Transactions in Previous 24h: {tx_24h}
+Time Since Last Transaction: {time_since_last_tx}
+Velocity Cutoff: {tx24_cutoff}
+Spending Spike Cutoff: {spike_cutoff}
 
-        result["disagreement_flag"] = disagreement
+Return JSON with:
+primary_concern
+secondary_concern
+evidence
+recommendation
 
-        return result
+Possible recommendations:
+- Contest Dispute
+- Send to Review
+- Accept Loss
 
-    except Exception as e:
+Do not invent evidence.
+"""
 
-        print(f"[WARN] OpenAI call failed ({e}). Using deterministic fallback rule.")
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful fraud investigation "
+                        "assistant. Use only supplied evidence."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0
+        )
 
-        return synthesize_evidence(transaction_id, amount, ml_score, threshold, amt_vs_avg, tx_24h, spike_cutoff, tx24_cutoff)
+        content = response.choices[0].message.content
+
+        llm_result = json.loads(content)
+
+        llm_recommendation = llm_result.get(
+            "recommendation",
+            rule_recommendation
+        )
+
+        disagreement_flag = (
+            llm_recommendation != rule_recommendation
+        )
+
+        return {
+            "primary_concern": llm_result.get(
+                "primary_concern",
+                primary_concern
+            ),
+            "secondary_concern": llm_result.get(
+                "secondary_concern",
+                secondary_concern
+            ),
+            "evidence": llm_result.get(
+                "evidence",
+                evidence
+            ),
+            "recommendation": llm_recommendation,
+            "rule_recommendation": rule_recommendation,
+            "disagreement_flag": disagreement_flag
+        }
+
+    except Exception:
+
+        return {
+            "primary_concern": primary_concern,
+            "secondary_concern": secondary_concern,
+            "evidence": evidence,
+            "recommendation": recommendation,
+            "rule_recommendation": rule_recommendation,
+            "disagreement_flag": disagreement_flag
+        }
